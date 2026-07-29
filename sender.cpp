@@ -1,10 +1,28 @@
 #include <iostream>
+#include <vector>
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+std::vector<std::vector<unsigned char>> frame_buffer;
+
+void store_frame(uint32_t seq, const unsigned char* payload) {
+    if (seq >= frame_buffer.size()) {
+        frame_buffer.resize(seq + 100);
+    }
+    frame_buffer[seq] = std::vector<unsigned char>(payload, payload + 160);
+}
+
+bool get_frame(uint32_t seq, unsigned char* out_payload) {
+    if (seq < frame_buffer.size() && !frame_buffer[seq].empty()) {
+        std::memcpy(out_payload, frame_buffer[seq].data(), 160);
+        return true;
+    }
+    return false;
+}
 
 int main(void) {
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -38,26 +56,35 @@ int main(void) {
 
     unsigned char buf[2048];
     unsigned char pkt[162];
+    unsigned char dup_pkt[162];
 
     while (true) {
         ssize_t n = recvfrom(in_fd, buf, sizeof buf, 0, NULL, NULL);
         if (n < 164) continue;
 
-        // buf[0..3] is big-endian seq, buf[4..163] is payload
         uint32_t be_seq;
         std::memcpy(&be_seq, buf, 4);
         uint32_t host_seq = ntohl(be_seq);
 
+        const unsigned char* payload = buf + 4;
+        store_frame(host_seq, payload);
+
+        // Send current packet
         pkt[0] = (unsigned char)((host_seq >> 8) & 0xFF);
         pkt[1] = (unsigned char)(host_seq & 0xFF);
-        std::memcpy(pkt + 2, buf + 4, 160);
-
-        // Send first copy
+        std::memcpy(pkt + 2, payload, 160);
         sendto(out_fd, pkt, 162, 0, (struct sockaddr *)&relay, sizeof relay);
 
-        // Send second copy for 9 out of 10 packets (keeps overhead at ~1.92x)
-        if (host_seq % 10 != 0) {
-            sendto(out_fd, pkt, 162, 0, (struct sockaddr *)&relay, sizeof relay);
+        // Send duplicate of previous packet 20ms later (when next frame arrives)
+        if (host_seq > 0) {
+            uint32_t prev_seq = host_seq - 1;
+            if (prev_seq % 20 != 0) { // Skip 1 out of 20 to keep overhead at ~1.97x
+                dup_pkt[0] = (unsigned char)((prev_seq >> 8) & 0xFF);
+                dup_pkt[1] = (unsigned char)(prev_seq & 0xFF);
+                if (get_frame(prev_seq, dup_pkt + 2)) {
+                    sendto(out_fd, dup_pkt, 162, 0, (struct sockaddr *)&relay, sizeof relay);
+                }
+            }
         }
     }
 
