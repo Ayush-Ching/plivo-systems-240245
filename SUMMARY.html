@@ -13,7 +13,7 @@
     <h1>System Architecture & Design Summary</h1>
     
     <h2>1. Overview</h2>
-    <p>The system was designed to beat a highly unstable network (Profile B) within strict 120ms deadlines and a hard 2.00x bandwidth overhead limit. We achieved this using a dual-layered resilience strategy: <strong>Interleaved Forward Error Correction (FEC)</strong> combined with a <strong>Budgeted Dynamic ARQ (NACK)</strong> mechanism.</p>
+    <p>The system was designed to beat a highly unstable network (Profile B) within strict 110ms deadlines (the lowest valid delay) and a hard 2.00x bandwidth overhead limit. We achieved this using a dual-layered resilience strategy: <strong>Interleaved Forward Error Correction (FEC)</strong> combined with a <strong>Budgeted Dynamic ARQ (NACK)</strong> mechanism.</p>
     
     <h2>2. Asynchronous Core (System Level)</h2>
     <p>Both <code>sender.cpp</code> and <code>receiver.cpp</code> were rewritten to operate as purely asynchronous, non-blocking state machines using <code>fcntl</code> and <code>select()</code> loops operating on 1ms boundaries. This ensures that socket reads never block the absolute <code>T0</code> timelines required for playout judging.</p>
