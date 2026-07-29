@@ -34,6 +34,8 @@ int main(void) {
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
     int reuse = 1;
     setsockopt(in_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    int rcvbuf = 1024 * 1024;
+    setsockopt(in_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     struct sockaddr_in in_addr = {0};
     in_addr.sin_family = AF_INET;
     in_addr.sin_port = htons(47010);
@@ -83,7 +85,7 @@ int main(void) {
                     const unsigned char* payload = buf + 4;
                     store_frame(host_seq, payload);
 
-                    if (host_seq >= 3 && host_seq % 10 != 0) { // 90% of time
+                    if (host_seq >= 3 && host_seq % 20 != 0) { // 95% of time
                         unsigned char pkt[325];
                         pkt[0] = 2; // Data + FEC
                         uint32_t net_seq = htonl(host_seq);

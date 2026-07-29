@@ -72,6 +72,7 @@ int main(void) {
     
     double srtt = 0.05;
     double rttvar = 0.02;
+    int total_nacks = 0;
 
     while (true) {
         fd_set readfds;
@@ -172,9 +173,9 @@ int main(void) {
         
         // Conservative NACKs: only send if we missed the FEC window
         if (t0 > 0) {
-            double expected_delay = srtt + 4.0 * rttvar; 
-            if (expected_delay < 0.04) expected_delay = 0.04;
-            if (expected_delay > 0.15) expected_delay = 0.15;
+            double expected_delay = srtt + 2.0 * rttvar; 
+            if (expected_delay < 0.02) expected_delay = 0.02;
+            if (expected_delay > 0.08) expected_delay = 0.08;
             
             uint32_t start_seq = (max_expected > 100) ? (max_expected - 100) : 0;
             for (uint32_t s = start_seq; s <= max_expected; s++) {
@@ -182,12 +183,15 @@ int main(void) {
                     double expected_arrival = t0 + (s + 3) * 0.02 + expected_delay;
                     if (now_s > expected_arrival) {
                         if (now_s - last_nack_time[s] > 0.06) {
-                            unsigned char nack_pkt[5];
-                            nack_pkt[0] = 3;
-                            uint32_t net_s = htonl(s);
-                            memcpy(nack_pkt + 1, &net_s, 4);
-                            sendto(nack_fd, nack_pkt, 5, 0, (struct sockaddr*)&relay_nack, sizeof(relay_nack));
-                            last_nack_time[s] = now_s;
+                            if (total_nacks < 25) {
+                                unsigned char nack_pkt[5];
+                                nack_pkt[0] = 3;
+                                uint32_t net_s = htonl(s);
+                                memcpy(nack_pkt + 1, &net_s, 4);
+                                sendto(nack_fd, nack_pkt, 5, 0, (struct sockaddr*)&relay_nack, sizeof(relay_nack));
+                                last_nack_time[s] = now_s;
+                                total_nacks++;
+                            }
                         }
                     }
                 }
