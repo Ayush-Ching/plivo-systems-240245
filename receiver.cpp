@@ -1,5 +1,6 @@
 #include <iostream>
 #include <vector>
+#include <set>
 #include <thread>
 #include <mutex>
 #include <unordered_map>
@@ -43,13 +44,26 @@ std::unordered_map<uint32_t, ParityState> parities_db; // keyed by odd seq (2i+1
 uint32_t highest_seq_seen = 0;
 std::chrono::steady_clock::time_point time_recv_highest_seq;
 bool has_received_any = false;
+std::set<uint32_t> missing_seqs;
 
 void update_highest_seq(uint32_t seq) {
-    if (!has_received_any || seq > highest_seq_seen) {
+    if (!has_received_any) {
         highest_seq_seen = seq;
         time_recv_highest_seq = std::chrono::steady_clock::now();
         has_received_any = true;
+    } else if (seq > highest_seq_seen) {
+        for (uint32_t j = highest_seq_seen + 1; j < seq; ++j) {
+            if (frames_db.find(j) == frames_db.end() || !frames_db[j].received) {
+                missing_seqs.insert(j);
+            }
+        }
+        highest_seq_seen = seq;
+        time_recv_highest_seq = std::chrono::steady_clock::now();
     }
+}
+
+void mark_received(uint32_t seq) {
+    missing_seqs.erase(seq);
 }
 
 void send_to_player(int player_fd, struct sockaddr_in player_addr, uint32_t seq, const unsigned char* payload) {
@@ -71,6 +85,7 @@ void try_fec(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq) {
 
     if (f_even.received && !f_odd.received) {
         f_odd.received = true;
+        mark_received(odd_seq);
         for (int i = 0; i < 160; ++i) {
             f_odd.payload[i] = f_even.payload[i] ^ parity.payload[i];
         }
@@ -80,6 +95,7 @@ void try_fec(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq) {
         }
     } else if (!f_even.received && f_odd.received) {
         f_even.received = true;
+        mark_received(even_seq);
         for (int i = 0; i < 160; ++i) {
             f_even.payload[i] = f_odd.payload[i] ^ parity.payload[i];
         }
@@ -93,6 +109,7 @@ void try_fec(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq) {
 void handle_data_packet(int player_fd, struct sockaddr_in player_addr, uint32_t seq, const unsigned char* payload) {
     std::lock_guard<std::recursive_mutex> lock(db_mutex);
     update_highest_seq(seq);
+    mark_received(seq);
 
     auto& f = frames_db[seq];
     if (!f.received) {
@@ -130,12 +147,12 @@ void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, d
         return; // Disable NACKs for ultra-low delay (Profile A at 40ms)
     }
 
-    double mult = 0.55;
+    double mult = 0.48; // Trigger NACK slightly earlier for Profile A 60ms
     if (delay_ms >= 80.0) {
         if (delay_ms <= 85.0) {
-            mult = 0.70; // Profile B low delay
+            mult = 0.65; // Profile B low delay
         } else {
-            mult = 0.65;
+            mult = 0.60;
         }
     }
 
@@ -161,38 +178,38 @@ void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, d
         auto now = std::chrono::steady_clock::now();
         double elapsed_since_S = std::chrono::duration<double>(now - time_recv_S).count();
 
-        int start_seq = std::max(0, (int)S - 100);
-        int end_seq = S;
-
         std::lock_guard<std::recursive_mutex> lock(db_mutex);
-        for (int j = start_seq; j < end_seq; ++j) {
-            auto& f = frames_db[j];
-            if (!f.received) {
-                // Estimate time since send based on S send time
-                double time_since_send = elapsed_since_S + (S - j) * 0.020 + 0.025; // 25ms average delay
+        for (auto it = missing_seqs.begin(); it != missing_seqs.end(); ) {
+            uint32_t j = *it;
+            if (j < S - 100) {
+                it = missing_seqs.erase(it);
+                continue;
+            }
 
-                if (time_since_send > nack_delay_sec && time_since_send < playout_delay_sec) {
-                    auto it = last_nack_sent.find(j);
-                    bool send_now = false;
-                    if (it == last_nack_sent.end()) {
+            double time_since_send = elapsed_since_S + (S - j) * 0.020 + 0.025; // 25ms average delay
+
+            if (time_since_send > nack_delay_sec && time_since_send < playout_delay_sec) {
+                auto it_nack = last_nack_sent.find(j);
+                bool send_now = false;
+                if (it_nack == last_nack_sent.end()) {
+                    send_now = true;
+                } else {
+                    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - it_nack->second).count();
+                    if (elapsed_ms >= nack_interval_ms) {
                         send_now = true;
-                    } else {
-                        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count();
-                        if (elapsed_ms >= nack_interval_ms) {
-                            send_now = true;
-                        }
-                    }
-
-                    if (send_now) {
-                        NackPacket nack;
-                        nack.type = 2;
-                        nack.seq = htonl(j);
-                        sendto(feedback_fd, &nack, sizeof(nack), 0,
-                               (struct sockaddr *)&relay_feedback_addr, sizeof(relay_feedback_addr));
-                        last_nack_sent[j] = now;
                     }
                 }
+
+                if (send_now) {
+                    NackPacket nack;
+                    nack.type = 2;
+                    nack.seq = htonl(j);
+                    sendto(feedback_fd, &nack, sizeof(nack), 0,
+                           (struct sockaddr *)&relay_feedback_addr, sizeof(relay_feedback_addr));
+                    last_nack_sent[j] = now;
+                }
             }
+            it++;
         }
     }
 }
@@ -209,6 +226,10 @@ int main(void) {
 
     int reuse = 1;
     setsockopt(in_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    // Increase socket receive buffer to 1MB to prevent OS packet drops
+    int rcvbuf = 1024 * 1024;
+    setsockopt(in_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     struct sockaddr_in in_addr = {0};
     in_addr.sin_family = AF_INET;
