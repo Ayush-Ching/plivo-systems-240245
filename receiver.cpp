@@ -12,16 +12,18 @@
 #include <chrono>
 #include <algorithm>
 
-struct __attribute__((packed)) RelayPacket {
+#pragma pack(push, 1)
+struct RelayPacket {
     uint8_t type;         // 0 = data, 1 = parity
     uint32_t seq;         // big-endian
     unsigned char payload[160];
 };
 
-struct __attribute__((packed)) NackPacket {
+struct NackPacket {
     uint8_t type;         // 2
     uint32_t seq;         // big-endian
 };
+#pragma pack(pop)
 
 struct FrameState {
     bool received = false;
@@ -38,8 +40,20 @@ std::recursive_mutex db_mutex;
 std::unordered_map<uint32_t, FrameState> frames_db;
 std::unordered_map<uint32_t, ParityState> parities_db; // keyed by odd seq (2i+1)
 uint32_t highest_seq_seen = 0;
-double t0 = 0.0;
-double max_delay_seen = 0.030; // 30ms baseline
+
+// Clock-independent steady time synchronization
+std::chrono::steady_clock::time_point local_t0;
+bool has_local_t0 = false;
+std::mutex time_mutex;
+
+void update_local_t0(uint32_t seq) {
+    std::lock_guard<std::mutex> lock(time_mutex);
+    if (!has_local_t0) {
+        local_t0 = std::chrono::steady_clock::now() - std::chrono::milliseconds(seq * 20 + 25);
+        has_local_t0 = true;
+        std::cout << "[Receiver] Initialized local_t0 relative to seq=" << seq << std::endl;
+    }
+}
 
 void send_to_player(int player_fd, struct sockaddr_in player_addr, uint32_t seq, const unsigned char* payload) {
     unsigned char send_buf[164];
@@ -66,6 +80,7 @@ void try_fec(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq) {
         if (!f_odd.sent_to_player) {
             f_odd.sent_to_player = true;
             send_to_player(player_fd, player_addr, odd_seq, f_odd.payload);
+            std::cout << "[Receiver] FEC recovered odd frame " << odd_seq << std::endl;
         }
     } else if (!f_even.received && f_odd.received) {
         f_even.received = true;
@@ -75,19 +90,14 @@ void try_fec(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq) {
         if (!f_even.sent_to_player) {
             f_even.sent_to_player = true;
             send_to_player(player_fd, player_addr, even_seq, f_even.payload);
+            std::cout << "[Receiver] FEC recovered even frame " << even_seq << std::endl;
         }
     }
 }
 
 void handle_data_packet(int player_fd, struct sockaddr_in player_addr, uint32_t seq, const unsigned char* payload) {
     std::lock_guard<std::recursive_mutex> lock(db_mutex);
-    double now_sec = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
-    double delay = now_sec - (t0 + seq * 0.020);
-    if (delay > 0.0 && delay < 0.5) {
-        if (delay > max_delay_seen) {
-            max_delay_seen = delay;
-        }
-    }
+    update_local_t0(seq);
 
     if (seq > highest_seq_seen) {
         highest_seq_seen = seq;
@@ -110,13 +120,7 @@ void handle_data_packet(int player_fd, struct sockaddr_in player_addr, uint32_t 
 
 void handle_parity_packet(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq, const unsigned char* payload) {
     std::lock_guard<std::recursive_mutex> lock(db_mutex);
-    double now_sec = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
-    double delay = now_sec - (t0 + odd_seq * 0.020);
-    if (delay > 0.0 && delay < 0.5) {
-        if (delay > max_delay_seen) {
-            max_delay_seen = delay;
-        }
-    }
+    update_local_t0(odd_seq);
 
     if (odd_seq > highest_seq_seen) {
         highest_seq_seen = odd_seq;
@@ -133,40 +137,56 @@ void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, d
     std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> last_nack_sent;
     double nack_interval_ms = std::max(40.0, delay_ms * 0.5);
 
+    // Disable NACKs entirely if the playout delay is too small to make RTT retransmissions useful
+    if (delay_ms <= 65.0) {
+        std::cout << "[Receiver] Playout delay <= 65ms: Disabling NACK feedback path." << std::endl;
+        return;
+    }
+
     while (true) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-        double now_sec = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
-        int max_expected_seq = (now_sec - t0) / 0.020;
+        std::chrono::steady_clock::time_point t0_local;
+        bool active = false;
+        {
+            std::lock_guard<std::mutex> lock(time_mutex);
+            if (has_local_t0) {
+                t0_local = local_t0;
+                active = true;
+            }
+        }
+        if (!active) continue;
+
+        auto now = std::chrono::steady_clock::now();
+        double elapsed_sec = std::chrono::duration<double>(now - t0_local).count();
+        int max_expected_seq = elapsed_sec / 0.020;
 
         if (max_expected_seq < 0) continue;
 
         int start_seq = std::max(0, max_expected_seq - 100);
         int end_seq = max_expected_seq;
 
-        double current_max_delay;
-        {
-            std::lock_guard<std::recursive_mutex> lock(db_mutex);
-            current_max_delay = std::min(max_delay_seen, delay_ms / 1000.0);
-        }
+        // Trigger NACKs after delay_ms * 0.55
+        double nack_delay_sec = (delay_ms / 1000.0) * 0.55;
 
         std::lock_guard<std::recursive_mutex> lock(db_mutex);
         for (int j = start_seq; j <= end_seq; ++j) {
             auto& f = frames_db[j];
             if (!f.received) {
-                double t_expected = t0 + j * 0.020;
-                double deadline = t_expected + delay_ms / 1000.0;
-                double nack_trigger = t_expected + current_max_delay + 0.005; // 5ms buffer after max delay seen
+                auto t_expected = t0_local + std::chrono::milliseconds(j * 20 + 25);
+                auto deadline = t_expected + std::chrono::milliseconds((int)delay_ms);
+                auto nack_trigger = t_expected + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(nack_delay_sec)
+                );
 
-                if (now_sec > nack_trigger && now_sec < deadline) {
-                    auto now_steady = std::chrono::steady_clock::now();
+                if (now > nack_trigger && now < deadline) {
                     auto it = last_nack_sent.find(j);
                     bool send_now = false;
                     if (it == last_nack_sent.end()) {
                         send_now = true;
                     } else {
-                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now_steady - it->second).count();
-                        if (elapsed >= nack_interval_ms) {
+                        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count();
+                        if (elapsed_ms >= nack_interval_ms) {
                             send_now = true;
                         }
                     }
@@ -177,7 +197,7 @@ void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, d
                         nack.seq = htonl(j);
                         sendto(feedback_fd, &nack, sizeof(nack), 0,
                                (struct sockaddr *)&relay_feedback_addr, sizeof(relay_feedback_addr));
-                        last_nack_sent[j] = now_steady;
+                        last_nack_sent[j] = now;
                     }
                 }
             }
@@ -186,9 +206,7 @@ void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, d
 }
 
 int main(void) {
-    const char* t0_str = std::getenv("T0");
     const char* delay_str = std::getenv("DELAY_MS");
-    t0 = t0_str ? std::strtod(t0_str, nullptr) : 0.0;
     double delay_ms = delay_str ? std::strtod(delay_str, nullptr) : 60.0;
 
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -235,6 +253,7 @@ int main(void) {
     std::thread nack_thread(nack_thread_func, feedback_fd, relay_feedback, delay_ms);
     nack_thread.detach();
 
+    int pkt_count = 0;
     unsigned char buf[2048];
     while (true) {
         ssize_t n = recvfrom(in_fd, buf, sizeof buf, 0, NULL, NULL);
@@ -242,6 +261,12 @@ int main(void) {
 
         RelayPacket* pkt = (RelayPacket*)buf;
         uint32_t host_seq = ntohl(pkt->seq);
+
+        pkt_count++;
+        if (pkt_count <= 10) {
+            std::cout << "[Receiver Debug] Recv packet " << pkt_count << ": type=" << (int)pkt->type 
+                      << ", seq=" << host_seq << ", size=" << n << std::endl;
+        }
 
         if (pkt->type == 0) {
             if (n < 165) continue;

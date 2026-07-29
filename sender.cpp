@@ -11,16 +11,18 @@
 #include <arpa/inet.h>
 #include <chrono>
 
-struct __attribute__((packed)) RelayPacket {
+#pragma pack(push, 1)
+struct RelayPacket {
     uint8_t type;         // 0 = data, 1 = parity
     uint32_t seq;         // big-endian
     unsigned char payload[160];
 };
 
-struct __attribute__((packed)) NackPacket {
+struct NackPacket {
     uint8_t type;         // 2
     uint32_t seq;         // big-endian
 };
+#pragma pack(pop)
 
 // Thread-safe frame buffer
 std::mutex buffer_mutex;
