@@ -70,7 +70,7 @@ int main(void) {
     int nack_fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in relay_nack = {0};
     relay_nack.sin_family = AF_INET;
-    relay_nack.sin_port = htons(47004); // Send NACKs to relay 47004
+    relay_nack.sin_port = htons(47003); // Send NACKs to relay 47003
     relay_nack.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     unsigned char buf[2048];
@@ -168,7 +168,7 @@ int main(void) {
                     }
                 }
                 
-                if (missing_count == 1 && missing_seq >= 0 && n_seq >= 3 && missing_seq == n_seq - 1 || missing_seq == n_seq - 2 || missing_seq == n_seq - 3) {
+                if (missing_count == 1 && n_seq >= 3 && (missing_seq == n_seq - 1 || missing_seq == n_seq - 2 || missing_seq == n_seq - 3)) {
                     unsigned char recovered[160];
                     memcpy(recovered, fec_buffer[n_seq].payload, 160);
                     for (uint32_t i = 1; i <= 3; i++) {

@@ -53,7 +53,7 @@ int main(void) {
     setsockopt(nack_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     struct sockaddr_in nack_addr = {0};
     nack_addr.sin_family = AF_INET;
-    nack_addr.sin_port = htons(47003);
+    nack_addr.sin_port = htons(47004);
     nack_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
     if (bind(nack_fd, (struct sockaddr *)&nack_addr, sizeof(nack_addr)) < 0) {
         perror("bind 47003");
