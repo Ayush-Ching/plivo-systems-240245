@@ -38,10 +38,7 @@ int main(void) {
     in_addr.sin_family = AF_INET;
     in_addr.sin_port = htons(47010);
     in_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    if (bind(in_fd, (struct sockaddr *)&in_addr, sizeof in_addr) < 0) {
-        perror("bind 47010");
-        return 1;
-    }
+    if (bind(in_fd, (struct sockaddr *)&in_addr, sizeof in_addr) < 0) return 1;
     
     int out_fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in relay = {0};
@@ -55,10 +52,7 @@ int main(void) {
     nack_addr.sin_family = AF_INET;
     nack_addr.sin_port = htons(47004);
     nack_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    if (bind(nack_fd, (struct sockaddr *)&nack_addr, sizeof(nack_addr)) < 0) {
-        perror("bind 47003");
-        return 1;
-    }
+    if (bind(nack_fd, (struct sockaddr *)&nack_addr, sizeof(nack_addr)) < 0) return 1;
     
     set_nonblocking(in_fd);
     set_nonblocking(nack_fd);
@@ -76,7 +70,7 @@ int main(void) {
         
         struct timeval tv;
         tv.tv_sec = 0;
-        tv.tv_usec = 1000; // 1ms
+        tv.tv_usec = 1000;
         
         select(max_fd + 1, &readfds, NULL, NULL, &tv);
         
@@ -89,19 +83,18 @@ int main(void) {
                     const unsigned char* payload = buf + 4;
                     store_frame(host_seq, payload);
 
-                    if (host_seq >= 3 && host_seq % 10 != 0) {
+                    if (host_seq >= 3 && host_seq % 10 != 0) { // 90% of time
                         unsigned char pkt[325];
                         pkt[0] = 2; // Data + FEC
                         uint32_t net_seq = htonl(host_seq);
                         memcpy(pkt + 1, &net_seq, 4);
                         memcpy(pkt + 5, payload, 160);
                         
-                        if (has_frame(host_seq - 1) && has_frame(host_seq - 2) && has_frame(host_seq - 3)) {
+                        if (has_frame(host_seq - 1) && has_frame(host_seq - 3)) {
                             const unsigned char* p1 = get_frame(host_seq - 1);
-                            const unsigned char* p2 = get_frame(host_seq - 2);
                             const unsigned char* p3 = get_frame(host_seq - 3);
                             for (int i = 0; i < 160; i++) {
-                                pkt[165 + i] = p1[i] ^ p2[i] ^ p3[i];
+                                pkt[165 + i] = p1[i] ^ p3[i];
                             }
                             sendto(out_fd, pkt, 325, 0, (struct sockaddr *)&relay, sizeof relay);
                         } else {

@@ -33,14 +33,6 @@ double get_now_s() {
     return std::chrono::duration<double>(now.time_since_epoch()).count();
 }
 
-void drain_socket(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    unsigned char junk[2048];
-    while (recvfrom(fd, junk, sizeof(junk), 0, NULL, NULL) > 0) {}
-    fcntl(fd, F_SETFL, flags);
-}
-
 void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -57,8 +49,6 @@ int main(void) {
     in_addr.sin_port = htons(47002);
     in_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
     bind(in_fd, (struct sockaddr *)&in_addr, sizeof in_addr);
-    
-    drain_socket(in_fd);
     set_nonblocking(in_fd);
 
     int player_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -70,7 +60,7 @@ int main(void) {
     int nack_fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in relay_nack = {0};
     relay_nack.sin_family = AF_INET;
-    relay_nack.sin_port = htons(47003); // Send NACKs to relay 47003
+    relay_nack.sin_port = htons(47003); // NACK to 47003
     relay_nack.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     unsigned char buf[2048];
@@ -90,10 +80,9 @@ int main(void) {
         
         struct timeval tv;
         tv.tv_sec = 0;
-        tv.tv_usec = 1000; // 1ms
+        tv.tv_usec = 1000;
         
         select(in_fd + 1, &readfds, NULL, NULL, &tv);
-        
         double now_s = get_now_s();
         
         if (FD_ISSET(in_fd, &readfds)) {
@@ -140,7 +129,7 @@ int main(void) {
             }
         }
         
-        // FEC decoding
+        // FEC decoding for FEC(n) = Data(n-1) ^ Data(n-3)
         bool changed = true;
         uint32_t max_expected = 0;
         if (t0 > 0) {
@@ -152,32 +141,19 @@ int main(void) {
             changed = false;
             uint32_t start_seq = (max_expected > 100) ? (max_expected - 100) : 0;
             for (uint32_t n_seq = start_seq; n_seq <= max_expected + 10; n_seq++) {
-                if (fec_buffer.find(n_seq) == fec_buffer.end() || !fec_buffer[n_seq].present) continue;
+                if (!fec_buffer[n_seq].present) continue;
                 
-                int missing_count = 0;
-                uint32_t missing_seq = 0;
-                for (uint32_t i = 1; i <= 3; i++) {
-                    if (n_seq >= i) {
-                        uint32_t target = n_seq - i;
-                        if (!data_buffer[target].present) {
-                            missing_count++;
-                            missing_seq = target;
-                        }
-                    } else {
-                        missing_count++; 
-                    }
-                }
+                bool has_1 = false, has_3 = false;
+                if (n_seq >= 1 && data_buffer[n_seq - 1].present) has_1 = true;
+                if (n_seq >= 3 && data_buffer[n_seq - 3].present) has_3 = true;
                 
-                if (missing_count == 1 && n_seq >= 3 && (missing_seq == n_seq - 1 || missing_seq == n_seq - 2 || missing_seq == n_seq - 3)) {
+                if (has_1 != has_3 && n_seq >= 3) {
+                    uint32_t missing_seq = has_1 ? (n_seq - 3) : (n_seq - 1);
+                    uint32_t present_seq = has_1 ? (n_seq - 1) : (n_seq - 3);
+                    
                     unsigned char recovered[160];
-                    memcpy(recovered, fec_buffer[n_seq].payload, 160);
-                    for (uint32_t i = 1; i <= 3; i++) {
-                        uint32_t target = n_seq - i;
-                        if (target != missing_seq) {
-                            for (int j = 0; j < 160; j++) {
-                                recovered[j] ^= data_buffer[target].payload[j];
-                            }
-                        }
+                    for (int j = 0; j < 160; j++) {
+                        recovered[j] = fec_buffer[n_seq].payload[j] ^ data_buffer[present_seq].payload[j];
                     }
                     data_buffer[missing_seq].present = true;
                     memcpy(data_buffer[missing_seq].payload, recovered, 160);
@@ -194,18 +170,18 @@ int main(void) {
             }
         }
         
-        // Dynamic NACK
+        // Conservative NACKs: only send if we missed the FEC window
         if (t0 > 0) {
-            double expected_delay = srtt + 2.0 * rttvar;
-            if (expected_delay < 0.02) expected_delay = 0.02;
-            if (expected_delay > 0.08) expected_delay = 0.08;
+            double expected_delay = srtt + 4.0 * rttvar; 
+            if (expected_delay < 0.04) expected_delay = 0.04;
+            if (expected_delay > 0.15) expected_delay = 0.15;
             
             uint32_t start_seq = (max_expected > 100) ? (max_expected - 100) : 0;
             for (uint32_t s = start_seq; s <= max_expected; s++) {
                 if (!data_buffer[s].present) {
-                    double expected_arrival = t0 + s * 0.02 + expected_delay;
+                    double expected_arrival = t0 + (s + 3) * 0.02 + expected_delay;
                     if (now_s > expected_arrival) {
-                        if (now_s - last_nack_time[s] > 0.04) {
+                        if (now_s - last_nack_time[s] > 0.06) {
                             unsigned char nack_pkt[5];
                             nack_pkt[0] = 3;
                             uint32_t net_s = htonl(s);
@@ -218,6 +194,5 @@ int main(void) {
             }
         }
     }
-    
     return 0;
 }
