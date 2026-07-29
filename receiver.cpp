@@ -39,18 +39,16 @@ struct ParityState {
 std::recursive_mutex db_mutex;
 std::unordered_map<uint32_t, FrameState> frames_db;
 std::unordered_map<uint32_t, ParityState> parities_db; // keyed by odd seq (2i+1)
+
 uint32_t highest_seq_seen = 0;
+std::chrono::steady_clock::time_point time_recv_highest_seq;
+bool has_received_any = false;
 
-// Clock-independent steady time synchronization
-std::chrono::steady_clock::time_point local_t0;
-bool has_local_t0 = false;
-std::mutex time_mutex;
-
-void update_local_t0(uint32_t seq) {
-    std::lock_guard<std::mutex> lock(time_mutex);
-    if (!has_local_t0) {
-        local_t0 = std::chrono::steady_clock::now() - std::chrono::milliseconds(seq * 20 + 25);
-        has_local_t0 = true;
+void update_highest_seq(uint32_t seq) {
+    if (!has_received_any || seq > highest_seq_seen) {
+        highest_seq_seen = seq;
+        time_recv_highest_seq = std::chrono::steady_clock::now();
+        has_received_any = true;
     }
 }
 
@@ -94,11 +92,8 @@ void try_fec(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq) {
 
 void handle_data_packet(int player_fd, struct sockaddr_in player_addr, uint32_t seq, const unsigned char* payload) {
     std::lock_guard<std::recursive_mutex> lock(db_mutex);
-    update_local_t0(seq);
+    update_highest_seq(seq);
 
-    if (seq > highest_seq_seen) {
-        highest_seq_seen = seq;
-    }
     auto& f = frames_db[seq];
     if (!f.received) {
         f.received = true;
@@ -117,11 +112,8 @@ void handle_data_packet(int player_fd, struct sockaddr_in player_addr, uint32_t 
 
 void handle_parity_packet(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq, const unsigned char* payload) {
     std::lock_guard<std::recursive_mutex> lock(db_mutex);
-    update_local_t0(odd_seq);
+    update_highest_seq(odd_seq);
 
-    if (odd_seq > highest_seq_seen) {
-        highest_seq_seen = odd_seq;
-    }
     auto& p = parities_db[odd_seq];
     if (!p.received) {
         p.received = true;
@@ -134,56 +126,52 @@ void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, d
     std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> last_nack_sent;
     double nack_interval_ms = std::max(40.0, delay_ms * 0.5);
 
-    // Disable NACKs for very low delays where retransmissions are mathematically useless
     if (delay_ms < 45.0) {
-        return;
+        return; // Disable NACKs for ultra-low delay (Profile A at 40ms)
     }
 
     double mult = 0.55;
     if (delay_ms >= 80.0) {
         if (delay_ms <= 85.0) {
-            mult = 0.70; // Prevent NACK flooding under tight delay budget
+            mult = 0.70; // Profile B low delay
         } else {
             mult = 0.65;
         }
     }
 
     double nack_delay_sec = (delay_ms / 1000.0) * mult;
+    double playout_delay_sec = delay_ms / 1000.0;
 
     while (true) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-        std::chrono::steady_clock::time_point t0_local;
+        uint32_t S;
+        std::chrono::steady_clock::time_point time_recv_S;
         bool active = false;
         {
-            std::lock_guard<std::mutex> lock(time_mutex);
-            if (has_local_t0) {
-                t0_local = local_t0;
+            std::lock_guard<std::recursive_mutex> lock(db_mutex);
+            if (has_received_any) {
+                S = highest_seq_seen;
+                time_recv_S = time_recv_highest_seq;
                 active = true;
             }
         }
         if (!active) continue;
 
         auto now = std::chrono::steady_clock::now();
-        double elapsed_sec = std::chrono::duration<double>(now - t0_local).count();
-        int max_expected_seq = elapsed_sec / 0.020;
+        double elapsed_since_S = std::chrono::duration<double>(now - time_recv_S).count();
 
-        if (max_expected_seq < 0) continue;
-
-        int start_seq = std::max(0, max_expected_seq - 100);
-        int end_seq = max_expected_seq;
+        int start_seq = std::max(0, (int)S - 100);
+        int end_seq = S;
 
         std::lock_guard<std::recursive_mutex> lock(db_mutex);
-        for (int j = start_seq; j <= end_seq; ++j) {
+        for (int j = start_seq; j < end_seq; ++j) {
             auto& f = frames_db[j];
             if (!f.received) {
-                auto t_send = t0_local + std::chrono::milliseconds(j * 20);
-                auto deadline = t_send + std::chrono::milliseconds((int)delay_ms);
-                auto nack_trigger = t_send + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                    std::chrono::duration<double>(nack_delay_sec)
-                );
+                // Estimate time since send based on S send time
+                double time_since_send = elapsed_since_S + (S - j) * 0.020 + 0.025; // 25ms average delay
 
-                if (now > nack_trigger && now < deadline) {
+                if (time_since_send > nack_delay_sec && time_since_send < playout_delay_sec) {
                     auto it = last_nack_sent.find(j);
                     bool send_now = false;
                     if (it == last_nack_sent.end()) {

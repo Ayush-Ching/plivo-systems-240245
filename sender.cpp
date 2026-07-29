@@ -80,8 +80,8 @@ void feedback_thread_func(int out_fd, struct sockaddr_in relay_addr) {
         auto it = last_retransmit.find(seq);
         if (it != last_retransmit.end()) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count();
-            if (elapsed < 30) {
-                continue; // Rate limit duplicate NACKs
+            if (elapsed < 10) {
+                continue; // Rate limit duplicate NACKs within a very small window
             }
         }
         last_retransmit[seq] = now;
