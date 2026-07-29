@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Architecture Summary</title>
+    <style>
+        body { font-family: -apple-system, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 2rem; color: #333; }
+        h1, h2 { color: #2c3e50; }
+        code { background: #f4f4f4; padding: 0.2rem 0.4rem; border-radius: 3px; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <h1>System Architecture & Design Summary</h1>
+    
+    <h2>1. Overview</h2>
+    <p>The system was designed to beat a highly unstable network (Profile B) within strict 120ms deadlines and a hard 2.00x bandwidth overhead limit. We achieved this using a dual-layered resilience strategy: <strong>Interleaved Forward Error Correction (FEC)</strong> combined with a <strong>Budgeted Dynamic ARQ (NACK)</strong> mechanism.</p>
+    
+    <h2>2. Asynchronous Core (System Level)</h2>
+    <p>Both <code>sender.cpp</code> and <code>receiver.cpp</code> were rewritten to operate as purely asynchronous, non-blocking state machines using <code>fcntl</code> and <code>select()</code> loops operating on 1ms boundaries. This ensures that socket reads never block the absolute <code>T0</code> timelines required for playout judging.</p>
+
+    <h2>3. Interleaved XOR FEC (The First Line of Defense)</h2>
+    <p>Rather than simple adjacent XOR blocks which fail on burst drops, we implemented an interleaved sliding window: <code>FEC(n) = Data(n-1) ^ Data(n-3)</code>. This separates the packets into two mathematically independent streams (Odds and Evens). A consecutive burst drop of 2 packets now mathematically isolates to one missing packet per stream, allowing perfect reconstruction without requesting NACKs. The sender transmits this FEC on 95% of frames, locking our proactive bandwidth investment at exactly 1.95x.</p>
+
+    <h2>4. Budgeted Dynamic NACKs (The Fallback)</h2>
+    <p>For drops that escape the FEC window, we implemented a feedback loop. The receiver tracks network jitter using a TCP-like EWMA (Exponentially Weighted Moving Average) of RTT variance (<code>srtt</code> and <code>rttvar</code>) relative to the harness's <code>T0</code> clock. Instead of waiting for gaps, it mathematically predicts when a packet is officially "lost" versus "delayed" and fires a NACK. To mathematically guarantee we never breach the 2.00x bandwidth limit in hostile jitter spikes, a hard lifetime budget of 25 NACKs was introduced.</p>
+</body>
+</html>
