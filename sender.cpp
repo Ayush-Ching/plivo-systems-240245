@@ -37,7 +37,7 @@ int main(void) {
     relay.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     unsigned char buf[2048];
-    unsigned char pkt[161];
+    unsigned char pkt[162];
 
     while (true) {
         ssize_t n = recvfrom(in_fd, buf, sizeof buf, 0, NULL, NULL);
@@ -48,15 +48,16 @@ int main(void) {
         std::memcpy(&be_seq, buf, 4);
         uint32_t host_seq = ntohl(be_seq);
 
-        pkt[0] = (unsigned char)(host_seq % 256);
-        std::memcpy(pkt + 1, buf + 4, 160);
+        pkt[0] = (unsigned char)((host_seq >> 8) & 0xFF);
+        pkt[1] = (unsigned char)(host_seq & 0xFF);
+        std::memcpy(pkt + 2, buf + 4, 160);
 
         // Send first copy
-        sendto(out_fd, pkt, 161, 0, (struct sockaddr *)&relay, sizeof relay);
+        sendto(out_fd, pkt, 162, 0, (struct sockaddr *)&relay, sizeof relay);
 
-        // Send second copy for 7 out of 8 packets (keeps overhead at ~1.89x)
-        if (host_seq % 8 != 0) {
-            sendto(out_fd, pkt, 161, 0, (struct sockaddr *)&relay, sizeof relay);
+        // Send second copy for 9 out of 10 packets (keeps overhead at ~1.92x)
+        if (host_seq % 10 != 0) {
+            sendto(out_fd, pkt, 162, 0, (struct sockaddr *)&relay, sizeof relay);
         }
     }
 

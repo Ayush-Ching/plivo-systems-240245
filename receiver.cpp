@@ -2,32 +2,21 @@
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-uint32_t highest_seq_seen = 0;
-bool has_received_any = false;
 bool sent_to_player[100000] = {false};
 
-uint32_t reconstruct_seq(uint8_t low_byte) {
-    if (!has_received_any) {
-        highest_seq_seen = low_byte;
-        has_received_any = true;
-        return low_byte;
+void drain_socket(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    unsigned char junk[2048];
+    while (recvfrom(fd, junk, sizeof(junk), 0, NULL, NULL) > 0) {
+        // discard leftover packets from previous runs
     }
-    int diff = (int)low_byte - (int)(highest_seq_seen % 256);
-    if (diff < -128) diff += 256;
-    if (diff > 128) diff -= 256;
-    
-    int candidate = (int)highest_seq_seen + diff;
-    if (candidate < 0) return 0;
-    
-    uint32_t u_candidate = (uint32_t)candidate;
-    if (u_candidate > highest_seq_seen) {
-        highest_seq_seen = u_candidate;
-    }
-    return u_candidate;
+    fcntl(fd, F_SETFL, flags);
 }
 
 int main(void) {
@@ -53,6 +42,9 @@ int main(void) {
         return 1;
     }
 
+    // Drain any leftover UDP packets from previous runs
+    drain_socket(in_fd);
+
     int player_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (player_fd < 0) {
         perror("player socket");
@@ -69,17 +61,16 @@ int main(void) {
 
     while (true) {
         ssize_t n = recvfrom(in_fd, buf, sizeof buf, 0, NULL, NULL);
-        if (n < 161) continue;
+        if (n < 162) continue;
 
-        uint8_t low_byte = buf[0];
-        uint32_t seq = reconstruct_seq(low_byte);
+        uint32_t seq = (buf[0] << 8) | buf[1];
 
         if (seq < 100000 && !sent_to_player[seq]) {
             sent_to_player[seq] = true;
 
             uint32_t be_seq = htonl(seq);
             std::memcpy(send_buf, &be_seq, 4);
-            std::memcpy(send_buf + 4, buf + 1, 160);
+            std::memcpy(send_buf + 4, buf + 2, 160);
 
             sendto(player_fd, send_buf, 164, 0, (struct sockaddr *)&player, sizeof(player));
         }
