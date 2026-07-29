@@ -38,6 +38,8 @@ std::recursive_mutex db_mutex;
 std::unordered_map<uint32_t, FrameState> frames_db;
 std::unordered_map<uint32_t, ParityState> parities_db; // keyed by odd seq (2i+1)
 uint32_t highest_seq_seen = 0;
+double t0 = 0.0;
+double max_delay_seen = 0.030; // 30ms baseline
 
 void send_to_player(int player_fd, struct sockaddr_in player_addr, uint32_t seq, const unsigned char* payload) {
     unsigned char send_buf[164];
@@ -79,6 +81,14 @@ void try_fec(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq) {
 
 void handle_data_packet(int player_fd, struct sockaddr_in player_addr, uint32_t seq, const unsigned char* payload) {
     std::lock_guard<std::recursive_mutex> lock(db_mutex);
+    double now_sec = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    double delay = now_sec - (t0 + seq * 0.020);
+    if (delay > 0.0 && delay < 0.5) {
+        if (delay > max_delay_seen) {
+            max_delay_seen = delay;
+        }
+    }
+
     if (seq > highest_seq_seen) {
         highest_seq_seen = seq;
     }
@@ -100,6 +110,14 @@ void handle_data_packet(int player_fd, struct sockaddr_in player_addr, uint32_t 
 
 void handle_parity_packet(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq, const unsigned char* payload) {
     std::lock_guard<std::recursive_mutex> lock(db_mutex);
+    double now_sec = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    double delay = now_sec - (t0 + odd_seq * 0.020);
+    if (delay > 0.0 && delay < 0.5) {
+        if (delay > max_delay_seen) {
+            max_delay_seen = delay;
+        }
+    }
+
     if (odd_seq > highest_seq_seen) {
         highest_seq_seen = odd_seq;
     }
@@ -111,9 +129,9 @@ void handle_parity_packet(int player_fd, struct sockaddr_in player_addr, uint32_
     }
 }
 
-void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, double t0, double delay_ms) {
+void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, double delay_ms) {
     std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> last_nack_sent;
-    double nack_interval_ms = std::max(30.0, delay_ms * 0.5);
+    double nack_interval_ms = std::max(40.0, delay_ms * 0.5);
 
     while (true) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -126,13 +144,19 @@ void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, d
         int start_seq = std::max(0, max_expected_seq - 100);
         int end_seq = max_expected_seq;
 
+        double current_max_delay;
+        {
+            std::lock_guard<std::recursive_mutex> lock(db_mutex);
+            current_max_delay = std::min(max_delay_seen, delay_ms / 1000.0);
+        }
+
         std::lock_guard<std::recursive_mutex> lock(db_mutex);
         for (int j = start_seq; j <= end_seq; ++j) {
             auto& f = frames_db[j];
             if (!f.received) {
                 double t_expected = t0 + j * 0.020;
                 double deadline = t_expected + delay_ms / 1000.0;
-                double nack_trigger = t_expected + (delay_ms / 1000.0) * 0.5;
+                double nack_trigger = t_expected + current_max_delay + 0.005; // 5ms buffer after max delay seen
 
                 if (now_sec > nack_trigger && now_sec < deadline) {
                     auto now_steady = std::chrono::steady_clock::now();
@@ -164,7 +188,7 @@ void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, d
 int main(void) {
     const char* t0_str = std::getenv("T0");
     const char* delay_str = std::getenv("DELAY_MS");
-    double t0 = t0_str ? std::strtod(t0_str, nullptr) : 0.0;
+    t0 = t0_str ? std::strtod(t0_str, nullptr) : 0.0;
     double delay_ms = delay_str ? std::strtod(delay_str, nullptr) : 60.0;
 
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -208,7 +232,7 @@ int main(void) {
     relay_feedback.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     // Launch NACK worker thread
-    std::thread nack_thread(nack_thread_func, feedback_fd, relay_feedback, t0, delay_ms);
+    std::thread nack_thread(nack_thread_func, feedback_fd, relay_feedback, delay_ms);
     nack_thread.detach();
 
     unsigned char buf[2048];
