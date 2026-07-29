@@ -51,7 +51,6 @@ void update_local_t0(uint32_t seq) {
     if (!has_local_t0) {
         local_t0 = std::chrono::steady_clock::now() - std::chrono::milliseconds(seq * 20 + 25);
         has_local_t0 = true;
-        std::cout << "[Receiver] Initialized local_t0 relative to seq=" << seq << std::endl;
     }
 }
 
@@ -80,7 +79,6 @@ void try_fec(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq) {
         if (!f_odd.sent_to_player) {
             f_odd.sent_to_player = true;
             send_to_player(player_fd, player_addr, odd_seq, f_odd.payload);
-            std::cout << "[Receiver] FEC recovered odd frame " << odd_seq << std::endl;
         }
     } else if (!f_even.received && f_odd.received) {
         f_even.received = true;
@@ -90,7 +88,6 @@ void try_fec(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq) {
         if (!f_even.sent_to_player) {
             f_even.sent_to_player = true;
             send_to_player(player_fd, player_addr, even_seq, f_even.payload);
-            std::cout << "[Receiver] FEC recovered even frame " << even_seq << std::endl;
         }
     }
 }
@@ -137,11 +134,21 @@ void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, d
     std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> last_nack_sent;
     double nack_interval_ms = std::max(40.0, delay_ms * 0.5);
 
-    // Disable NACKs entirely if the playout delay is too small to make RTT retransmissions useful
-    if (delay_ms <= 65.0) {
-        std::cout << "[Receiver] Playout delay <= 65ms: Disabling NACK feedback path." << std::endl;
+    // Disable NACKs for very low delays where retransmissions are mathematically useless
+    if (delay_ms < 45.0) {
         return;
     }
+
+    double mult = 0.55;
+    if (delay_ms >= 80.0) {
+        if (delay_ms <= 85.0) {
+            mult = 0.70; // Prevent NACK flooding under tight delay budget
+        } else {
+            mult = 0.65;
+        }
+    }
+
+    double nack_delay_sec = (delay_ms / 1000.0) * mult;
 
     while (true) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -166,16 +173,13 @@ void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, d
         int start_seq = std::max(0, max_expected_seq - 100);
         int end_seq = max_expected_seq;
 
-        // Trigger NACKs after delay_ms * 0.55
-        double nack_delay_sec = (delay_ms / 1000.0) * 0.55;
-
         std::lock_guard<std::recursive_mutex> lock(db_mutex);
         for (int j = start_seq; j <= end_seq; ++j) {
             auto& f = frames_db[j];
             if (!f.received) {
-                auto t_expected = t0_local + std::chrono::milliseconds(j * 20 + 25);
-                auto deadline = t_expected + std::chrono::milliseconds((int)delay_ms);
-                auto nack_trigger = t_expected + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                auto t_send = t0_local + std::chrono::milliseconds(j * 20);
+                auto deadline = t_send + std::chrono::milliseconds((int)delay_ms);
+                auto nack_trigger = t_send + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                     std::chrono::duration<double>(nack_delay_sec)
                 );
 
@@ -253,7 +257,6 @@ int main(void) {
     std::thread nack_thread(nack_thread_func, feedback_fd, relay_feedback, delay_ms);
     nack_thread.detach();
 
-    int pkt_count = 0;
     unsigned char buf[2048];
     while (true) {
         ssize_t n = recvfrom(in_fd, buf, sizeof buf, 0, NULL, NULL);
@@ -261,12 +264,6 @@ int main(void) {
 
         RelayPacket* pkt = (RelayPacket*)buf;
         uint32_t host_seq = ntohl(pkt->seq);
-
-        pkt_count++;
-        if (pkt_count <= 10) {
-            std::cout << "[Receiver Debug] Recv packet " << pkt_count << ": type=" << (int)pkt->type 
-                      << ", seq=" << host_seq << ", size=" << n << std::endl;
-        }
 
         if (pkt->type == 0) {
             if (n < 165) continue;
