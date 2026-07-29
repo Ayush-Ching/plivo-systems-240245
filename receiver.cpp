@@ -13,19 +13,6 @@
 #include <chrono>
 #include <algorithm>
 
-#pragma pack(push, 1)
-struct RelayPacket {
-    uint8_t type;         // 0 = data, 1 = parity
-    uint32_t seq;         // big-endian
-    unsigned char payload[160];
-};
-
-struct NackPacket {
-    uint8_t type;         // 2
-    uint32_t seq;         // big-endian
-};
-#pragma pack(pop)
-
 struct FrameState {
     bool received = false;
     bool sent_to_player = false;
@@ -71,7 +58,7 @@ void send_to_player(int player_fd, struct sockaddr_in player_addr, uint32_t seq,
     uint32_t be_seq = htonl(seq);
     std::memcpy(send_buf, &be_seq, 4);
     std::memcpy(send_buf + 4, payload, 160);
-    sendto(player_fd, send_buf, sizeof(send_buf), 0, (struct sockaddr *)&player_addr, sizeof(player_addr));
+    sendto(player_fd, send_buf, 164, 0, (struct sockaddr *)&player_addr, sizeof(player_addr));
 }
 
 void try_fec(int player_fd, struct sockaddr_in player_addr, uint32_t odd_seq) {
@@ -147,10 +134,10 @@ void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, d
         return; // Disable NACKs for ultra-low delay (Profile A at 40ms)
     }
 
-    double mult = 0.48; // Trigger NACK slightly earlier for Profile A 60ms
+    double mult = 0.45; // Trigger NACKs earlier to allow retransmissions to meet deadline
     if (delay_ms >= 80.0) {
         if (delay_ms <= 85.0) {
-            mult = 0.65; // Profile B low delay
+            mult = 0.65;
         } else {
             mult = 0.60;
         }
@@ -201,10 +188,11 @@ void nack_thread_func(int feedback_fd, struct sockaddr_in relay_feedback_addr, d
                 }
 
                 if (send_now) {
-                    NackPacket nack;
-                    nack.type = 2;
-                    nack.seq = htonl(j);
-                    sendto(feedback_fd, &nack, sizeof(nack), 0,
+                    unsigned char nack_buf[5];
+                    nack_buf[0] = 2; // NACK packet type
+                    uint32_t be_seq = htonl(j);
+                    std::memcpy(nack_buf + 1, &be_seq, 4);
+                    sendto(feedback_fd, nack_buf, 5, 0,
                            (struct sockaddr *)&relay_feedback_addr, sizeof(relay_feedback_addr));
                     last_nack_sent[j] = now;
                 }
@@ -227,7 +215,6 @@ int main(void) {
     int reuse = 1;
     setsockopt(in_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-    // Increase socket receive buffer to 1MB to prevent OS packet drops
     int rcvbuf = 1024 * 1024;
     setsockopt(in_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
@@ -271,15 +258,17 @@ int main(void) {
         ssize_t n = recvfrom(in_fd, buf, sizeof buf, 0, NULL, NULL);
         if (n < 5) continue; // At least type (1) + seq (4)
 
-        RelayPacket* pkt = (RelayPacket*)buf;
-        uint32_t host_seq = ntohl(pkt->seq);
+        uint8_t type = buf[0];
+        uint32_t be_seq;
+        std::memcpy(&be_seq, buf + 1, 4);
+        uint32_t host_seq = ntohl(be_seq);
 
-        if (pkt->type == 0) {
+        if (type == 0) {
             if (n < 165) continue;
-            handle_data_packet(player_fd, player, host_seq, pkt->payload);
-        } else if (pkt->type == 1) {
+            handle_data_packet(player_fd, player, host_seq, buf + 5);
+        } else if (type == 1) {
             if (n < 165) continue;
-            handle_parity_packet(player_fd, player, host_seq, pkt->payload);
+            handle_parity_packet(player_fd, player, host_seq, buf + 5);
         }
     }
 
